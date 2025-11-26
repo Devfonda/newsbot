@@ -35,6 +35,7 @@ FEEDS = {
 
 MAX_SENDS_PER_POLL = 3
 PER_FEED_COOLDOWN_SECONDS = 45
+BATCH_SIZE = 3
 
 def _get_conn():
     if not DATABASE_URL:
