@@ -1,0 +1,139 @@
+﻿import os
+import time
+import hashlib
+import logging
+import feedparser
+import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from .scraper import fetch_url
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
+BOT_TOKEN = "8249944565:AAH3gLQ9E_UvsJ9rVGmWEC3syNOV9Jmha4U"
+CHAT_ID = "-1003398047018"
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+KEYWORDS = [
+    "right issue",
+    "aksi korporasi",
+    "rups",
+    "akuisisi",
+    "backdoor",
+    "expansi",
+    "ekspansi",
+    "stock split",
+    "stock-split",
+    "ipo",
+]
+
+FEEDS = {
+    "cnbc_market": "https://www.cnbcindonesia.com/market/rss/",
+    "kontan_keuangan": "https://www.kontan.co.id/feed",
+}
+
+MAX_SENDS_PER_POLL = 3
+PER_FEED_COOLDOWN_SECONDS = 45
+
+def _get_conn():
+    if not DATABASE_URL:
+        return None
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+_conn = _get_conn()
+
+if _conn:
+    with _conn:
+        with _conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS seen (
+                    url TEXT PRIMARY KEY,
+                    fp TEXT,
+                    ts TIMESTAMP DEFAULT now()
+                );
+            """)
+
+def _is_seen(url: str, fp: str) -> bool:
+    if not _conn:
+        return False
+    with _conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM seen WHERE url=%s OR fp=%s LIMIT 1", (url, fp))
+        return cur.fetchone() is not None
+
+def _mark_seen(url: str, fp: str):
+    if not _conn:
+        return
+    with _conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO seen (url, fp) VALUES (%s, %s) ON CONFLICT (url) DO NOTHING",
+            (url, fp),
+        )
+    _conn.commit()
+
+def send_telegram(text):
+    if not BOT_TOKEN or not CHAT_ID:
+        logger.warning("Telegram credentials missing.")
+        return
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}
+    r = requests.post(url, data=data, timeout=10)
+    return r.text
+
+def _match_keyword(title: str, content: str) -> bool:
+    t = (title or "").lower()
+    c = (content or "").lower()
+    for kw in KEYWORDS:
+        if kw in t or kw in c:
+            return True
+    return False
+
+def process_entry(feed_name: str, entry):
+    url = entry.get("link")
+    title = entry.get("title", "")
+
+    fp = hashlib.sha1(f"{feed_name}:{url}".encode()).hexdigest()
+
+    if _is_seen(url, fp):
+        logger.info(f"[{feed_name}] SKIP seen: {title}")
+        return {"sent": False, "reason": "seen"}
+
+    html = fetch_url(url, prefer_uc=False, timeout=10, retries=2)
+
+    if not _match_keyword(title, html):
+        logger.info(f"[{feed_name}] FILTERED not matched: {title}")
+        _mark_seen(url, fp)
+        return {"sent": False, "reason": "filtered"}
+
+    msg = f"{title}\n{url}"
+    send_telegram(msg)
+    logger.info(f"[{feed_name}] SENT: {title}")
+
+    _mark_seen(url, fp)
+    return {"sent": True}
+
+def poll_once():
+    sends = 0
+    for feed_name, feed_url in FEEDS.items():
+        logger.info(f"Fetching {feed_name} -> {feed_url}")
+        parsed = feedparser.parse(feed_url)
+
+        for entry in parsed.entries:
+            if sends >= MAX_SENDS_PER_POLL:
+                break
+            r = process_entry(feed_name, entry)
+            if r.get("sent"):
+                sends += 1
+                time.sleep(2)
+
+        logger.info(f"[{feed_name}] cooldown {PER_FEED_COOLDOWN_SECONDS}s")
+        time.sleep(PER_FEED_COOLDOWN_SECONDS)
+
+def run_loop(interval_seconds=300):
+    while True:
+        try:
+            poll_once()
+        except Exception as e:
+            logger.error(f"Error in loop: {e}")
+        time.sleep(interval_seconds)

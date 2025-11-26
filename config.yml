@@ -1,0 +1,27 @@
+# config.yml
+feeds:
+  cnbc_market: "https://www.cnbcindonesia.com/market/rss/"
+  kontan_keuangan: "https://www.kontan.co.id/feed"
+
+poll:
+  seconds: 300
+
+telegram:
+  bot_token_env: "BOT_TOKEN"      # nama env var yang menyimpan token
+  chat_id_env: "CHANNEL_ID"      # nama env var yang menyimpan chat id
+
+filter:
+  enabled: true
+  keywords:
+    - "right issue"
+    - "aksi korporasi"
+    - "right"
+    - "dividen"
+    - "ipo"
+    - "rights"
+    - "rights issue"
+
+scrape:
+  enabled: true         # kalau true -> fetch full article when keyword matches
+  prefer_uc: true       # use your fetch_url prefer_uc param (Playwright)
+  max_chars: 800        # truncate full article to this length for Telegram

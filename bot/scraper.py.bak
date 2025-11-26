@@ -1,0 +1,56 @@
+﻿# bot/scraper.py
+import logging
+from .scraper_uc import fetch_with_uc
+from .scraper_requests import fetch_with_requests
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
+def fetch_url(url, prefer_uc=False, uc_timeout=30, retries=2, proxy=None):
+    """
+    Hybrid fetch:
+    - prefer_uc: if True -> Playwright first
+    - otherwise try requests first (fast), fallback to Playwright
+    - uc_timeout: seconds (30) or ms (30000) — fetch_with_uc normalizes
+    - retries: attempts for Playwright
+    - proxy: optional proxy string for Playwright
+    """
+    # If prefer_uc, try Playwright first
+    if prefer_uc:
+        logger.info("fetch_url: using requests only for %s", url)
+        try:
+            html = fetch_with_uc(url, timeout=uc_timeout, headless=True, retries=retries, proxy=proxy)
+            logger.info("fetch_url: fetch_with_uc succeeded (len=%d)", len(html))
+            return html
+        except Exception as e:
+            logger.warning("fetch_url: fetch_with_uc failed: %s — falling back to requests", e)
+
+    # Try requests first
+    try:
+        logger.info("fetch_url: trying requests for %s", url)
+        html = fetch_with_requests(url, timeout=10)
+        if html and len(html) > 400:
+            logger.info("fetch_url: fetch_with_requests succeeded (len=%d)", len(html))
+            return html
+        logger.info("fetch_url: requests returned small content (len=%d) -> will try Playwright", len(html) if html else 0)
+    except Exception as e:
+        logger.debug("fetch_url: requests failed: %s", e)
+
+    # Try Playwright as fallback
+    try:
+        logger.info("fetch_url: trying Playwright fallback for %s", url)
+        html = fetch_with_uc(url, timeout=uc_timeout, headless=True, retries=retries, proxy=proxy)
+        logger.info("fetch_url: fetch_with_uc succeeded (len=%d)", len(html))
+        return html
+    except Exception as e:
+        logger.warning("fetch_url: fetch_with_uc fallback failed: %s", e)
+
+    # Final fallback: try requests again with longer timeout
+    try:
+        logger.info("fetch_url: final requests attempt for %s", url)
+        html = fetch_with_requests(url, timeout=20)
+        logger.info("fetch_url: final fetch_with_requests succeeded (len=%d)", len(html))
+        return html
+    except Exception as e:
+        logger.exception("fetch_url: all attempts failed for %s", url)
+        raise
