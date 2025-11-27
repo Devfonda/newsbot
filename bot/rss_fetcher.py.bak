@@ -1,307 +1,140 @@
-# bot/rss_fetcher.py
-"""
-RSS fetcher + processor for news bot
-- file-based dedupe (data/seen.txt)
-- rate limiting: MAX_SENDS_PER_POLL, PER_FEED_COOLDOWN_SECONDS
-- optional batching (BATCH_SIZE)
-- uses env vars NEWSBOT_BOT_TOKEN and NEWSBOT_CHAT_ID by default
-"""
-
-from pathlib import Path
-import hashlib
+﻿import os
 import time
+import hashlib
 import logging
+import feedparser
 import requests
-import os
-import threading
-
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from .scraper import fetch_url
-from tools.parse_article import extract_article
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
-# -----------------------------
-# Config (tune to your need)
-# -----------------------------
+BOT_TOKEN = "8249944565:AAH3gLQ9E_UvsJ9rVGmWEC3syNOV9Jmha4U"
+CHAT_ID = "-1003398047018"
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+KEYWORDS = [
+    "right issue",
+    "aksi korporasi",
+    "rups",
+    "akuisisi",
+    "backdoor",
+    "expansi",
+    "ekspansi",
+    "stock split",
+    "stock-split",
+    "ipo",
+]
+
 FEEDS = {
     "cnbc_market": "https://www.cnbcindonesia.com/market/rss/",
     "kontan_keuangan": "https://www.kontan.co.id/feed",
-    # add more feeds here
 }
 
-# Token / chat id: prefer env vars to avoid leaking secrets in code
-BOT_TOKEN = "8249944565:AAH3gLQ9E_UvsJ9rVGmWEC3syNOV9Jmha4U"
-CHAT_ID = "-1003398047018"
+MAX_SENDS_PER_POLL = 3
+PER_FEED_COOLDOWN_SECONDS = 45
+BATCH_SIZE = 3
 
-# Safety/rate-limiting parameters
-POLL_INTERVAL_SECONDS = 300         # default 5 minutes between polls
-MAX_SENDS_PER_POLL = 3              # max telegram messages per poll
-PER_FEED_COOLDOWN_SECONDS = 600     # cooldown per feed (10 minutes)
-BATCH_SIZE = 3                      # group up to 3 articles into one message (set 1 to disable)
+def _get_conn():
+    if not DATABASE_URL:
+        return None
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-# -----------------------------
-# File-based dedupe (data/seen.txt)
-# -----------------------------
-SEEN_PATH = Path("data/seen.txt")
-SEEN_PATH.parent.mkdir(exist_ok=True, parents=True)
+_conn = _get_conn()
 
-_seen_lock = threading.Lock()
-if SEEN_PATH.exists():
-    try:
-        with SEEN_PATH.open("r", encoding="utf-8") as f:
-            _seen_set = set(line.strip() for line in f if line.strip())
-    except Exception:
-        _seen_set = set()
-else:
-    _seen_set = set()
-
-def _fingerprint_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+if _conn:
+    with _conn:
+        with _conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS seen (
+                    url TEXT PRIMARY KEY,
+                    fp TEXT,
+                    ts TIMESTAMP DEFAULT now()
+                );
+            """)
 
 def _is_seen(url: str, fp: str) -> bool:
-    key_url = f"u:{url}"
-    key_fp = f"f:{fp}"
-    with _seen_lock:
-        return (key_url in _seen_set) or (key_fp in _seen_set)
+    if not _conn:
+        return False
+    with _conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM seen WHERE url=%s OR fp=%s LIMIT 1", (url, fp))
+        return cur.fetchone() is not None
 
 def _mark_seen(url: str, fp: str):
-    key_url = f"u:{url}"
-    key_fp = f"f:{fp}"
-    to_append = []
-    with _seen_lock:
-        if key_url not in _seen_set:
-            _seen_set.add(key_url)
-            to_append.append(key_url)
-        if key_fp not in _seen_set:
-            _seen_set.add(key_fp)
-            to_append.append(key_fp)
-    if to_append:
-        try:
-            with SEEN_PATH.open("a", encoding="utf-8") as f:
-                for k in to_append:
-                    f.write(k + "\n")
-        except Exception:
-            with _seen_lock:
-                for k in to_append:
-                    _seen_set.discard(k)
-            raise
+    if not _conn:
+        return
+    with _conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO seen (url, fp) VALUES (%s, %s) ON CONFLICT (url) DO NOTHING",
+            (url, fp),
+        )
+    _conn.commit()
 
-# -----------------------------
-# Telegram sender (simple)
-# -----------------------------
-TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
-
-def send_telegram(message: str, parse_mode: str = "HTML", disable_preview: bool = False) -> dict:
-    token = BOT_TOKEN
-    chat_id = CHAT_ID
-    if not token or not chat_id:
-        logger.info("Telegram not configured; message would be:\n%s", message)
-        return {"ok": False, "error": "not-configured"}
-
-    url = TELEGRAM_API.format(token=token, method="sendMessage")
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": disable_preview,
-    }
-    try:
-        r = requests.post(url, data=payload, timeout=15)
-        r.raise_for_status()
-        # return API JSON (useful for debug/inspection)
-        return r.json()
-    except Exception as e:
-        logger.exception("send_telegram failed: %s", e)
-        return {"ok": False, "error": str(e)}
-
-# -----------------------------
-# Formatting helpers
-# -----------------------------
-def _format_message(title: str, content: str, url: str) -> str:
-    title_safe = (title or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    snippet = ""
-    if content:
-        snippet = content.strip().split("\n\n")[0]
-        if len(snippet) > 400:
-            snippet = snippet[:397] + "..."
-    snippet_safe = snippet.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    return f"<b>{title_safe}</b>\n\n{snippet_safe}\n\n{url}"
-
-def _format_batch_message(items):
-    # items: list of dicts with 'title','snippet','url'
-    lines = []
-    for it in items:
-        t = it.get("title","").strip()
-        s = it.get("snippet","").strip()
-        u = it.get("url","")
-        lines.append(f"<b>{t}</b>\n{s}\n{u}")
-    return "\n\n---\n\n".join(lines)
-
-# -----------------------------
-# rate-limiting state (in-memory)
-# -----------------------------
-_last_sent_per_feed = {}   # feed_name -> last_sent_ts
-
-def _should_send_for_feed(feed_name: str, now_ts: float):
-    last = _last_sent_per_feed.get(feed_name)
-    if last and (now_ts - last) < PER_FEED_COOLDOWN_SECONDS:
-        return False
-    return True
-
-def _record_sent_for_feed(feed_name: str, now_ts: float):
-    _last_sent_per_feed[feed_name] = now_ts
-
-# -----------------------------
-# Processing single entry
-# -----------------------------
-def process_entry(feed_name: str, entry):
-    url = None
-    try:
-        url = entry.get("link") if hasattr(entry, "get") else getattr(entry, "link", None)
-        title_from_feed = entry.get("title") if hasattr(entry, "get") else getattr(entry, "title", "")
-        if not url:
-            logger.warning("process_entry: entry missing link: %r", entry)
-            return
-
-        logger.info("[%s] Processing %s", feed_name, url)
-
-        # fetch HTML
-        try:
-            html = fetch_url(url, prefer_uc=False, uc_timeout=30, retries=2)
-            if not html:
-                raise RuntimeError("Empty HTML returned by fetch_url")
-        except Exception as e:
-            logger.exception("[%s] fetch_url failed for %s: %s", feed_name, url, e)
-            raise
-
-        parsed = extract_article(html)
-        title = parsed.get("title") or title_from_feed or ""
-        content = parsed.get("content") or ""
-        snippet = (content.strip().split("\n\n")[0] if content else "")[:400]
-
-        fp_source = (title + "\n" + (snippet or ""))[:1000]
-        fp = _fingerprint_text(fp_source)
-
-        # if already seen, skip
-        if _is_seen(url, fp):
-            logger.debug("[%s] Skipping seen article: %s", feed_name, url)
-            return {"sent": False, "reason": "seen"}
-
-        # else prepare payload for send (actual decision to send done in poll_once)
-        return {"sent": False, "reason": "ready", "title": title, "snippet": snippet, "url": url, "fp": fp}
-    except Exception:
-        logger.exception("Failed processing entry %s", url)
-        return {"sent": False, "reason": "error"}
-
-# -----------------------------
-# Patched poll_once with rate-limits + batching
-# -----------------------------
-def poll_once():
-    try:
-        import feedparser
-    except Exception:
-        logger.exception("feedparser not installed. Install with `pip install feedparser`.")
+def send_telegram(text):
+    if not BOT_TOKEN or not CHAT_ID:
+        logger.warning("Telegram credentials missing.")
         return
 
-    now_global = time.time()
-    sends_this_poll = 0
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}
+    r = requests.post(url, data=data, timeout=10)
+    return r.text
 
+def _match_keyword(title: str, content: str) -> bool:
+    t = (title or "").lower()
+    c = (content or "").lower()
+    for kw in KEYWORDS:
+        if kw in t or kw in c:
+            return True
+    return False
+
+def process_entry(feed_name: str, entry):
+    url = entry.get("link")
+    title = entry.get("title", "")
+
+    fp = hashlib.sha1(f"{feed_name}:{url}".encode()).hexdigest()
+
+    if _is_seen(url, fp):
+        logger.info(f"[{feed_name}] SKIP seen: {title}")
+        return {"sent": False, "reason": "seen"}
+
+    html = fetch_url(url, prefer_uc=False, timeout=10, retries=2)
+
+    if not _match_keyword(title, html):
+        logger.info(f"[{feed_name}] FILTERED not matched: {title}")
+        _mark_seen(url, fp)
+        return {"sent": False, "reason": "filtered"}
+
+    msg = f"{title}\n{url}"
+    send_telegram(msg)
+    logger.info(f"[{feed_name}] SENT: {title}")
+
+    _mark_seen(url, fp)
+    return {"sent": True}
+
+def poll_once():
+    sends = 0
     for feed_name, feed_url in FEEDS.items():
-        try:
-            logger.info("Fetching %s -> %s", feed_name, feed_url)
-            feed = feedparser.parse(feed_url)
-            if not hasattr(feed, "entries"):
-                logger.warning("feedparser returned no entries for %s", feed_url)
-                continue
+        logger.info(f"Fetching {feed_name} -> {feed_url}")
+        parsed = feedparser.parse(feed_url)
 
-            # process entries oldest-first so we send older unseen items first
-            entries = list(feed.entries)
-            entries.reverse()
-
-            feed_can_send = _should_send_for_feed(feed_name, now_global)
-            batch_buffer = []
-
-            for entry in entries:
-                if sends_this_poll >= MAX_SENDS_PER_POLL:
-                    logger.info("Reached MAX_SENDS_PER_POLL (%d), stopping sends this poll", MAX_SENDS_PER_POLL)
-                    break
-
-                result = process_entry(feed_name, entry)
-                if not result or result.get("reason") != "ready":
-                    # skip on seen / error
-                    continue
-
-                # if feed in cooldown, mark seen (so it won't be retried soon) but don't send now
-                if not feed_can_send:
-                    logger.info("[%s] Feed in cooldown, marking seen without sending: %s", feed_name, result["url"])
-                    _mark_seen(result["url"], result["fp"])
-                    continue
-
-                # batching logic
-                if BATCH_SIZE and BATCH_SIZE > 1:
-                    batch_buffer.append({"title": result["title"], "snippet": result["snippet"], "url": result["url"], "fp": result["fp"]})
-                    if len(batch_buffer) >= BATCH_SIZE:
-                        message = _format_batch_message(batch_buffer)
-                        res = send_telegram(message)
-                        if res.get("ok"):
-                            now_send = time.time()
-                            _record_sent_for_feed(feed_name, now_send)
-                            for it in batch_buffer:
-                                _mark_seen(it["url"], it["fp"])
-                            sends_this_poll += 1
-                        else:
-                            logger.warning("Batch send returned error: %s", res.get("error"))
-                        batch_buffer = []
-                else:
-                    # single send
-                    message = _format_message(result["title"], result["snippet"], result["url"])
-                    res = send_telegram(message)
-                    if res.get("ok"):
-                        now_send = time.time()
-                        _record_sent_for_feed(feed_name, now_send)
-                        _mark_seen(result["url"], result["fp"])
-                        sends_this_poll += 1
-                    else:
-                        logger.warning("[%s] Telegram send returned error: %s", feed_name, res.get("error"))
-
-                if sends_this_poll >= MAX_SENDS_PER_POLL:
-                    logger.info("Reached global send cap for this poll")
-                    break
-
-            # after iterating, flush any remaining batch_buffer if cap allows and feed_can_send still true
-            if batch_buffer and sends_this_poll < MAX_SENDS_PER_POLL and _should_send_for_feed(feed_name, time.time()):
-                message = _format_batch_message(batch_buffer)
-                res = send_telegram(message)
-                if res.get("ok"):
-                    now_send = time.time()
-                    _record_sent_for_feed(feed_name, now_send)
-                    for it in batch_buffer:
-                        _mark_seen(it["url"], it["fp"])
-                    sends_this_poll += 1
-                else:
-                    logger.warning("Final batch send returned error: %s", res.get("error"))
-
-            if sends_this_poll >= MAX_SENDS_PER_POLL:
-                logger.info("Stopping processing early due to MAX_SENDS_PER_POLL")
+        for entry in parsed.entries:
+            if sends >= MAX_SENDS_PER_POLL:
                 break
+            r = process_entry(feed_name, entry)
+            if r.get("sent"):
+                sends += 1
+                time.sleep(2)
 
-        except Exception:
-            logger.exception("Error polling feed %s (%s)", feed_name, feed_url)
+        logger.info(f"[{feed_name}] cooldown {PER_FEED_COOLDOWN_SECONDS}s")
+        time.sleep(PER_FEED_COOLDOWN_SECONDS)
 
-    logger.info("poll_once complete: sent %d messages", sends_this_poll)
-
-# -----------------------------
-# Loop runner
-# -----------------------------
-def run_loop(interval_seconds: int = POLL_INTERVAL_SECONDS):
-    logger.info("Starting poll loop, interval=%s seconds", interval_seconds)
-    try:
-        while True:
+def run_loop(interval_seconds=300):
+    while True:
+        try:
             poll_once()
-            time.sleep(interval_seconds)
-    except KeyboardInterrupt:
-        logger.info("Stopping poll loop (KeyboardInterrupt)")
-
-if __name__ == "__main__":
-    poll_once()
+        except Exception as e:
+            logger.error(f"Error in loop: {e}")
+        time.sleep(interval_seconds)
